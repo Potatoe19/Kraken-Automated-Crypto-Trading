@@ -1,5 +1,7 @@
 This program uses Kraken API and Moving average convergence/divergence to determine which cryptos to sell and buy
 
+You'll need Kraken API keys
+
 
 For Running in Jupyter Notebook: Create a cell above containing
 
