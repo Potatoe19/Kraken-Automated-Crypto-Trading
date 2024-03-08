@@ -1,1 +1,220 @@
+!pip install keras tensorflow scikit-learn pandas numpy krakenex pyinstaller
+import krakenex
+import pandas as pd
+import numpy as np
+import time
+import logging
+
+from tensorflow.keras.layers import LSTM
+from tensorflow.keras.initializers import HeNormal
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.layers import Dropout
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense
+from tensorflow.keras.optimizers import Adam
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from datetime import datetime
+timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+def get_api_credentials(): #Prompt to enter required API keys
+    api_key = input("Enter your Kraken API Key: ")
+    api_secret = input("Enter your Kraken Private Key: ")
+    return api_key, api_secret
+
+def get_market_data(api, pair, interval): 
+    response = api.query_public('OHLC', {'pair': pair, 'interval': interval})
+    if response.get('error'):
+        logging.error(f"API Error for pair {pair} at interval {interval}: {response['error']}")
+        raise Exception(response['error'])
+    try:
+        data = pd.DataFrame(response['result'][pair], columns=['time', 'open', 'high', 'low', 'close', 'vwap', 'volume', 'count'])
+        for col in ['open', 'high', 'low', 'close', 'vwap', 'volume']:
+            data[col] = data[col].astype(float)
+        return data
+    except KeyError:
+        logging.error(f"KeyError: Could not find {pair} in API response. Response keys: {response['result'].keys()}")
+        raise KeyError(f"Could not find {pair} in API response.")
+    
+    return data
+def calculate_macd(data, short_window=12, long_window=26, signal=9):
+    # Ensure 'close' is treated as numeric
+    data['close'] = pd.to_numeric(data['close'], errors='coerce')
+    data['EMA12'] = data['close'].ewm(span=short_window, adjust=False).mean()
+    data['EMA26'] = data['close'].ewm(span=long_window, adjust=False).mean()
+    data['MACD'] = data['EMA12'] - data['EMA26']
+    data['Signal_Line'] = data['MACD'].ewm(span=signal, adjust=False).mean()
+    return data
+
+def calculate_rsi(data, periods=14):
+    # Ensure 'close' is treated as numeric
+    data['close'] = pd.to_numeric(data['close'], errors='coerce')
+    delta = data['close'].diff(1)
+    gain = (delta.where(delta > 0, 0)).rolling(window=periods).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=periods).mean()
+    RS = gain / loss
+    data['RSI'] = 100 - (100 / (1 + RS))
+    return data
+
+
+def calculate_moving_averages(data, short_window=12, long_window=26):
+    """
+    Calculate short-term and long-term moving averages.
+    :param data: DataFrame containing the market data.
+    :param short_window: The window size for the short-term moving average.
+    :param long_window: The window size for the long-term moving average.
+    :return: DataFrame with moving averages added.
+    """
+    data['short_mavg'] = data['close'].astype(float).rolling(window=short_window, min_periods=1).mean()
+    data['long_mavg'] = data['close'].astype(float).rolling(window=long_window, min_periods=1).mean()
+    return data
+
+from sklearn.preprocessing import StandardScaler
+
+def preprocess_data(data):
+    """
+    Convert market data into a format suitable for CNN, including moving averages, MACD, and RSI.
+    """
+    data = calculate_moving_averages(data)
+    data.replace([np.inf, -np.inf], np.nan, inplace=True)
+    data.dropna(inplace=True)
+    data = calculate_macd(data)
+    data.replace([np.inf, -np.inf], np.nan, inplace=True)
+    data.dropna(inplace=True)
+    data = calculate_rsi(data)
+    data.replace([np.inf, -np.inf], np.nan, inplace=True)
+    data.dropna(inplace=True)
+    
+    # Define the initial feature list before extending with technical indicators
+    features = ['open', 'high', 'low', 'close', 'volume', 'short_mavg', 'long_mavg', 'MACD', 'Signal_Line', 'RSI']
+    
+    for col in features:
+        data[col] = pd.to_numeric(data[col], errors='coerce')
+
+    data['target'] = (data['close'] > data['open']).astype(int)
+
+    X = data[features].astype(float).values
+    y = data['target'].values
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    X_train_scaled = X_train_scaled.reshape((X_train_scaled.shape[0], X_train_scaled.shape[1], 1))
+    X_test_scaled = X_test_scaled.reshape((X_test_scaled.shape[0], X_test_scaled.shape[1], 1))
+
+    return X_train_scaled, X_test_scaled, y_train, y_test, features
+
+
+
+
+def create_cnn_short_interval(features):
+    model = Sequential()
+    model.add(Conv1D(filters=128, kernel_size=3, activation='relu', input_shape=(len(features), 1)))
+    model.add(MaxPooling1D(pool_size=2))
+    model.add(Dropout(0.25))
+    model.add(Conv1D(filters=64, kernel_size=2, activation='relu'))
+    model.add(MaxPooling1D(pool_size=2))
+    model.add(Dropout(0.25))
+    model.add(Flatten())
+    model.add(Dense(100, activation='relu'))
+    model.add(Dropout(0.25))
+    model.add(Dense(1, activation='sigmoid'))
+    
+    optimizer = Adam(learning_rate=0.0005)
+    model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+def create_cnn_medium_interval(features):
+    model = Sequential()
+    model.add(Conv1D(filters=64, kernel_size=3, activation='relu', input_shape=(len(features), 1)))
+    model.add(MaxPooling1D(pool_size=2))
+    model.add(Dropout(0.2))
+    model.add(Conv1D(filters=64, kernel_size=2, activation='relu'))
+    model.add(Flatten())
+    model.add(Dense(80, activation='relu'))
+    model.add(Dropout(0.2))
+    model.add(Dense(1, activation='sigmoid'))
+    
+    optimizer = Adam(learning_rate=0.00075)  # Adjusted learning rate for medium complexity
+    model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+
+def create_cnn_long_interval(features):
+    model = Sequential()
+    model.add(Conv1D(filters=32, kernel_size=5, activation='relu', padding='same', input_shape=(len(features), 1)))
+    model.add(MaxPooling1D(pool_size=4))
+    model.add(Dropout(0.15))
+    model.add(Flatten())
+    model.add(Dense(50, activation='relu'))
+    model.add(Dropout(0.15))
+    model.add(Dense(1, activation='sigmoid'))
+    
+    optimizer = Adam(learning_rate=0.001)  # Higher learning rate for less complex model
+    model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+
+
+
+
+
+
+
+
+def train_model_for_pairs_and_intervals(api, pairs, intervals, epochs=1000, batch_size=32):
+    early_stopping = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
+
+    for pair in pairs:
+        for interval in intervals:
+            print(f"Training model for {pair} on interval {interval}")
+            try:
+                data = get_market_data(api, pair, interval)
+                X_train, X_test, y_train, y_test, features = preprocess_data(data)
+                
+                # Determine data size for dynamic model complexity adjustment
+                data_size = len(X_train) + len(X_test)
+                
+              
+                if interval in [1, 5, 15, 30]:
+                    model = create_cnn_short_interval(features)
+                elif interval in [60, 240, 1440]:
+                    model = create_cnn_medium_interval(features)
+                else:
+                    model = create_cnn_long_interval(features)
+                
+                model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, verbose=1, validation_data=(X_test, y_test), callbacks=[early_stopping])
+                
+            except Exception as e:
+                print(f"An error occurred while processing {pair} on interval {interval}: {e}")
+
+
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    try:
+        api_key, api_secret = get_api_credentials()
+        api = krakenex.API(key=api_key, secret=api_secret)
+        
+        # Define your list of trading pairs here
+        pairs = ['XXBTZUSD'     
+                ]
+        
+        # Define the intervals you want to train on
+        intervals = [1, 5, 15, 30, 60, 240, 1440, 10080, 21600]
+        
+        # Now call the training function with the list of pairs and intervals
+        train_model_for_pairs_and_intervals(api, pairs, intervals, epochs=1000, batch_size=32)
+        
+    except Exception as e:
+        logging.error(f"An error occurred in main: {e}")
+
+if __name__ == "__main__":
+    main()
 
